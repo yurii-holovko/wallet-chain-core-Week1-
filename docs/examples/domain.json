@@ -1,0 +1,6 @@
+{
+  "name": "WalletChain",
+  "version": "1",
+  "chainId": 1,
+  "verifyingContract": "0x0000000000000000000000000000000000000000"
+}

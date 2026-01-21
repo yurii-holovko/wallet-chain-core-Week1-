@@ -1,0 +1,10 @@
+{
+  "action": "transfer",
+  "amount": "1.5",
+  "token": "ETH",
+  "recipient": "0x000000000000000000000000000000000000dead",
+  "meta": {
+    "note": "example payload",
+    "tags": ["test", "demo"]
+  }
+}

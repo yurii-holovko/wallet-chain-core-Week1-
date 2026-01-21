@@ -1,0 +1,10 @@
+{
+  "to": "0x000000000000000000000000000000000000dEaD",
+  "value": 0,
+  "data": "0x",
+  "nonce": 0,
+  "gas": 21000,
+  "maxFeePerGas": 1000000000,
+  "maxPriorityFeePerGas": 100000000,
+  "chainId": 1
+}

@@ -1,1 +1,213 @@
-# wallet-chain-core-Week1-
+# Wallet Chain Core (Week 1)
+
+Part 1 implements secure wallet management, canonical serialization, and base
+types used across the project. A CLI wraps these features for quick testing.
+
+## Quick Start
+
+```bash
+python -m venv venv
+.\venv\Scripts\activate  # Windows
+make setup
+python src/main.py generate
+```
+
+PowerShell:
+```powershell
+$env:PRIVATE_KEY = "0xYOUR_PRIVATE_KEY"  # pragma: allowlist secret
+make run
+```
+
+## Getting Started
+
+### Prerequisites
+* **Python 3.14+**
+* **Git**
+
+### Installation
+1. **Setup environment**:
+```bash
+python -m venv venv
+.\venv\Scripts\activate  # Windows
+source venv/bin/activate  # macOS/Linux
+```
+
+2. **Install tools**:
+```bash
+make setup
+```
+
+
+
+## Development Tools
+
+* **Formatter**: `black` & `isort`
+* **Linter**: `flake8`
+* **Tests**: `pytest`
+* **Security**: `detect-secrets`
+
+## Commands
+
+Use the following `make` commands for a standardized workflow:
+
+| Command | Description |
+| --- | --- |
+| `make run` | Executes the main application (`src/main.py`) |
+| `make test` | Runs the full `pytest` suite |
+| `make check` | Runs the full suite: formatting (black/isort), linting (flake8), and tests |
+| `make setup` | Installs dependencies and sets up pre-commit hooks |
+
+## Project Structure
+
+```
+src/
+  core/
+    wallet_manager.py   # key management + signing
+    serializer.py       # canonical JSON + keccak hashing
+    base_types.py       # Address, TokenAmount, Transaction types
+  chain/
+    __init__.py         # reserved for chain logic (Week 2+)
+  main.py               # CLI entrypoint
+docs/
+  examples/             # sample JSON payloads for CLI
+```
+
+## Part 1: WalletManager CLI
+
+The CLI is in `src/main.py` and is used by `make run`. Wallet logic lives in
+`src/core/wallet_manager.py`. The `chain/` module is reserved for transaction
+building, sending, and analysis.
+
+### Environment setup
+
+The default commands read the private key from `PRIVATE_KEY`:
+
+PowerShell:
+```powershell
+$env:PRIVATE_KEY = "0xYOUR_PRIVATE_KEY"  # pragma: allowlist secret
+```
+
+macOS/Linux:
+```bash
+export PRIVATE_KEY="0xYOUR_PRIVATE_KEY"  # pragma: allowlist secret
+```
+
+### Run
+
+Default command prints the address from `PRIVATE_KEY`:
+```bash
+make run
+```
+
+You can also call the CLI directly with subcommands:
+```bash
+python src/main.py address
+python src/main.py generate
+python src/main.py sign-message "hello"
+```
+
+### Canonical serialization
+
+`CanonicalSerializer` produces deterministic JSON and its keccak hash.
+Rules:
+- Keys sorted (recursive)
+- No whitespace
+- Unicode preserved (UTF-8)
+- Floats rejected (use strings/integers)
+
+Use the CLI:
+```bash
+python src/main.py serialize --input docs/examples/payload.json
+python src/main.py hash --input docs/examples/payload.json
+python src/main.py verify-determinism --input docs/examples/payload.json --iterations 50
+```
+
+### Base types
+
+`Address` validates and normalizes to checksum (case-insensitive equality).
+`TokenAmount` stores raw integer (wei) and uses `Decimal` for human values.
+`TransactionRequest` produces a web3-compatible dict.
+`TransactionReceipt` parses a receipt and computes tx fee.
+
+### Transaction input validation
+
+`sign-transaction` validates inputs early with clear errors:
+- Required fields: `nonce`, `gas`, `value`, `data`, `chainId`
+- Fee: either `gasPrice` **or** both `maxFeePerGas` and `maxPriorityFeePerGas`
+- `to` is checksummed (or `null` for contract creation)
+- Numeric fields accept `int` or `0x...` hex string
+
+### Typed data signing (EIP-712)
+
+Provide JSON files for domain, types, and value:
+```bash
+python src/main.py sign-typed-data --domain docs/examples/domain.json --types docs/examples/types.json --value docs/examples/value.json
+```
+
+### Transaction signing
+
+Provide a JSON file containing the transaction dict:
+```bash
+python src/main.py sign-transaction --tx docs/examples/tx.json
+```
+
+### Base types helpers
+
+Build a transaction dict from a type-safe spec (uses `Address` + `TokenAmount`):
+```bash
+python src/main.py build-transaction --input docs/examples/tx_spec.json
+```
+
+Example `tx_spec.json`:
+```json
+{
+  "to": "0x000000000000000000000000000000000000dead",
+  "value_human": "1.5",
+  "decimals": 18,
+  "symbol": "ETH",
+  "data": "0x",
+  "nonce": 1,
+  "gas_limit": 21000,
+  "max_fee_per_gas": 1000000000,
+  "max_priority_fee": 100000000,
+  "chain_id": 1
+}
+```
+
+Compute fee from a receipt (uses `TransactionReceipt` + `TokenAmount`):
+```bash
+python src/main.py receipt-fee --input docs/examples/receipt.json
+```
+
+### Encrypted keyfile import/export
+
+Export from `PRIVATE_KEY`:
+```bash
+python src/main.py keyfile-export --path wallet.json --password "strong-password"
+```
+
+Import and print address:
+```bash
+python src/main.py keyfile-import --path wallet.json --password "strong-password"
+```
+
+### Examples directory
+
+All sample payloads are under `docs/examples/`:
+- `domain.json`, `types.json`, `value.json` (EIP-712)
+- `tx.json` (transaction signing)
+- `payload.json` (canonical serialization)
+- `tx_spec.json` (base types transaction builder)
+- `receipt.json` (fee calculation)
+
+### Tests
+
+Run all tests:
+```bash
+make test
+```
+
+Run formatting, linting, and tests:
+```bash
+make check
+```
