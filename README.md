@@ -37,6 +37,10 @@ source venv/bin/activate  # macOS/Linux
 make setup
 ```
 
+### IDE setup (important)
+Mark `src/` as a **Sources Root** so imports like `from core...` and
+`from chain...` resolve correctly.
+
 
 
 ## Development Tools
