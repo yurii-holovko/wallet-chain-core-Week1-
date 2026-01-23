@@ -66,7 +66,10 @@ src/
     serializer.py       # canonical JSON + keccak hashing
     base_types.py       # Address, TokenAmount, Transaction types
   chain/
-    __init__.py         # reserved for chain logic (Week 2+)
+    __init__.py         # chain module exports
+    client.py           # RPC client with retries and error handling
+    transaction_builder.py  # fluent transaction builder
+    analyzer.py         # tx analysis CLI
   main.py               # CLI entrypoint
 docs/
   examples/             # sample JSON payloads for CLI
@@ -211,3 +214,117 @@ Run formatting, linting, and tests:
 ```bash
 make check
 ```
+
+## Part 2: Chain Module
+
+### RPC Client
+
+`ChainClient` provides resilient JSON-RPC calls with retries, backoff, and
+endpoint fallback. It classifies common errors (insufficient funds, nonce too
+low, replacement underpriced) and exposes helpers for balance, nonce, gas price,
+estimate gas, send transaction, and receipts.
+
+Example:
+```python
+from chain import ChainClient
+from core.base_types import Address
+
+client = ChainClient(["https://rpc.example"])
+balance = client.get_balance(Address.from_string("0x000000000000000000000000000000000000dead"))
+nonce = client.get_nonce(Address.from_string("0x000000000000000000000000000000000000dead"))
+```
+
+### GasPrice
+
+`GasPrice` wraps base/priority fees and computes `maxFeePerGas` with a buffer:
+```python
+gas = client.get_gas_price()
+max_fee = gas.get_max_fee("high")
+```
+
+### Transaction Builder
+
+Fluent builder that composes a `TransactionRequest`, estimates gas, sets fees,
+signs, and sends.
+
+```python
+from chain import TransactionBuilder
+from core.base_types import Address, TokenAmount
+
+tx = (
+    TransactionBuilder(client, wallet)
+    .to(Address.from_string("0x000000000000000000000000000000000000dead"))
+    .value(TokenAmount.from_human("0.1", 18, "ETH"))
+    .data(b"")
+    .with_gas_estimate()
+    .with_gas_price("high")
+    .build()
+)
+```
+
+To send:
+```python
+tx_hash = (
+    TransactionBuilder(client, wallet)
+    .to(Address.from_string("0x000000000000000000000000000000000000dead"))
+    .value(TokenAmount.from_human("0.1", 18, "ETH"))
+    .data(b"")
+    .with_gas_estimate()
+    .with_gas_price("medium")
+    .send()
+)
+```
+
+### Transaction Analyzer CLI (Optional)
+
+Analyze any transaction:
+```bash
+python -m chain.analyzer <tx_hash> --rpc <URL>
+python -m chain.analyzer <tx_hash> --rpc <URL> --format json
+```
+
+Features:
+- Function decoding for common ERC-20/Uniswap calls
+- Transfer/Swap/Sync event parsing
+- Pending tx handling, invalid hash checks
+- Revert reason (when available)
+- Token metadata caching
+
+## Part 3: Integration Test
+
+Run the Sepolia integration test end-to-end:
+```bash
+SEPOLIA_RPC_URL=... RECIPIENT_ADDRESS=0x... PRIVATE_KEY=0x... python scripts/integration_test.py
+```
+
+Expected flow:
+- Loads wallet from `PRIVATE_KEY`
+- Connects to Sepolia
+- Checks balance
+- Builds an ETH transfer
+- Estimates gas and sets fees
+- Signs and verifies signature locally
+- Sends transaction and waits for receipt
+- Prints receipt analysis and PASS/FAIL
+
+## Acceptance Checklist
+
+Required:
+- [x] `WalletManager` loads key from env, signs messages and transactions
+- [x] Private key never appears in logs/repr/str (tested)
+- [x] `CanonicalSerializer` deterministic over 1000 iterations
+- [x] `Address` and `TokenAmount` with full validation
+- [x] `ChainClient` connects, gets balance, estimates gas, sends transactions
+- [x] `TransactionBuilder` creates and signs valid transactions
+- [x] Transaction Analyzer CLI works on mainnet txs
+- [x] Integration test passes on Sepolia (requires RPC + funded key)
+- [x] Minimum 15 unit tests covering edge cases (37 tests)
+- [x] README with setup and usage examples
+
+Test coverage:
+- [x] Wallet: key security, signing, verification
+- [x] Serializer: all listed edge cases
+- [x] Types: validation, arithmetic, equality
+- [x] Client: retry logic, error classification
+- [x] Builder: validation, gas estimation
+- [x] Analyzer: parsing, decoding, edge cases

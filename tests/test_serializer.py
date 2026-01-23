@@ -43,6 +43,11 @@ def test_verify_determinism_true():
     assert CanonicalSerializer.verify_determinism(obj, iterations=10) is True
 
 
+def test_verify_determinism_1000_iterations():
+    obj = {"b": [1, 2, 3], "a": {"x": "y"}}
+    assert CanonicalSerializer.verify_determinism(obj, iterations=1000) is True
+
+
 def test_verify_determinism_rejects_zero_iterations():
     with pytest.raises(ValueError, match="iterations"):
         CanonicalSerializer.verify_determinism({"a": 1}, iterations=0)
