@@ -1,5 +1,7 @@
 import pytest
 from eth_account import Account
+from eth_account.messages import encode_defunct
+from eth_utils.address import to_checksum_address
 
 from core.wallet_manager import WalletManager, _mask_private_key
 
@@ -42,4 +44,34 @@ def test_sign_typed_data_rejects_invalid_types_before_crypto(monkeypatch):
     monkeypatch.setattr("core.wallet_manager.encode_typed_data", fail_encode)
 
     with pytest.raises(TypeError, match="types must be a non-empty dict"):
-        wallet.sign_typed_data(domain={}, types=[], value={})
+        wallet.sign_typed_data(domain={}, types=[], value={})  # type: ignore[arg-type]
+
+
+def test_sign_message_recovery_matches_address():
+    wallet = WalletManager(Account.create().key)
+    message = "hello from tests"
+
+    signed = wallet.sign_message(message)
+    recovered = Account.recover_message(
+        encode_defunct(text=message), signature=signed.signature
+    )
+
+    assert recovered.lower() == wallet.address.lower()
+
+
+def test_sign_transaction_recovery_matches_address():
+    wallet = WalletManager(Account.create().key)
+    tx = {
+        "nonce": 0,
+        "to": to_checksum_address("0x" + "1" * 40),
+        "value": 123,
+        "gas": 21000,
+        "gasPrice": 1,
+        "data": b"",
+        "chainId": 1,
+    }
+
+    signed = wallet.sign_transaction(tx)
+    recovered = Account.recover_transaction(signed.raw_transaction)
+
+    assert recovered.lower() == wallet.address.lower()
