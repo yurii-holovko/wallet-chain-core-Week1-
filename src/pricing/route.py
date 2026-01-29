@@ -1,4 +1,4 @@
-from uniswap_v2_pair import Token, UniswapV2Pair
+from .uniswap_v2_pair import Token, UniswapV2Pair
 
 
 class Route:

@@ -345,11 +345,11 @@ Test coverage:
 Pricing module for AMM math, routing, simulation, and mempool monitoring.
 
 ### Modules
-- `pricing/uniswap_v2_pair.py`: Uniswap V2 pair math and helpers
-- `pricing/route.py`: route modeling and route finding
-- `pricing/fork_simulator.py`: swap/route simulation on forked RPC
-- `pricing/mempool_monitor.py`: mempool swap parsing/monitoring
-- `pricing/pricing_engine.py`: orchestration entry point
+- `src/pricing/uniswap_v2_pair.py`: Uniswap V2 pair math and helpers
+- `src/pricing/route.py`: route modeling and route finding
+- `src/pricing/fork_simulator.py`: swap/route simulation on forked RPC
+- `src/pricing/mempool_monitor.py`: mempool swap parsing/monitoring
+- `src/pricing/pricing_engine.py`: orchestration entry point
 
 ### Status
 Work in progress; interfaces may change as Week 2 evolves.

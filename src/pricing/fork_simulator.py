@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from route import Route
-from uniswap_v2_pair import Token, UniswapV2Pair
 from web3 import Web3
 
 from core.base_types import Address
+
+from .route import Route
+from .uniswap_v2_pair import Token, UniswapV2Pair
 
 
 class ForkSimulator:
