@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import Decimal
 
+from eth_abi import decode
+from eth_utils.crypto import keccak
+
 from chain.client import ChainClient
-from core.base_types import Address
+from core.base_types import Address, TokenAmount, TransactionRequest
 
 
 @dataclass(frozen=True)
@@ -170,4 +173,86 @@ class UniswapV2Pair:
         """
         Fetch pair data from on-chain.
         """
-        ...
+        token0_addr = _call_pair_address(client, address, "token0()")
+        token1_addr = _call_pair_address(client, address, "token1()")
+        reserve0, reserve1 = _call_pair_reserves(client, address)
+
+        token0 = _build_token(client, token0_addr)
+        token1 = _build_token(client, token1_addr)
+
+        return cls(
+            address=address,
+            token0=token0,
+            token1=token1,
+            reserve0=reserve0,
+            reserve1=reserve1,
+        )
+
+
+def _selector_hash(signature: str) -> str:
+    return f"0x{keccak(text=signature).hex()[:8]}"
+
+
+def _call_pair_address(client: ChainClient, pair: Address, signature: str) -> Address:
+    data = _selector_hash(signature)
+    tx = TransactionRequest(
+        to=pair,
+        value=TokenAmount(raw=0, decimals=18),
+        data=_hex_to_bytes(data),
+    )
+    raw = client.call(tx)
+    (decoded,) = decode(["address"], raw)
+    return Address.from_string(decoded)
+
+
+def _call_pair_reserves(client: ChainClient, pair: Address) -> tuple[int, int]:
+    data = _selector_hash("getReserves()")
+    tx = TransactionRequest(
+        to=pair,
+        value=TokenAmount(raw=0, decimals=18),
+        data=_hex_to_bytes(data),
+    )
+    raw = client.call(tx)
+    reserve0, reserve1, _ = decode(["uint112", "uint112", "uint32"], raw)
+    return int(reserve0), int(reserve1)
+
+
+def _build_token(client: ChainClient, token_address: Address) -> Token:
+    symbol = _call_token_string(client, token_address, "symbol()")
+    decimals = _call_token_uint8(client, token_address, "decimals()")
+    return Token(address=token_address, symbol=symbol, decimals=decimals)
+
+
+def _call_token_string(client: ChainClient, token: Address, signature: str) -> str:
+    data = _selector_hash(signature)
+    tx = TransactionRequest(
+        to=token,
+        value=TokenAmount(raw=0, decimals=18),
+        data=_hex_to_bytes(data),
+    )
+    raw = client.call(tx)
+    if len(raw) == 32:
+        return raw.rstrip(b"\x00").decode("utf-8", errors="ignore")
+    (decoded,) = decode(["string"], raw)
+    return str(decoded)
+
+
+def _call_token_uint8(client: ChainClient, token: Address, signature: str) -> int:
+    data = _selector_hash(signature)
+    tx = TransactionRequest(
+        to=token,
+        value=TokenAmount(raw=0, decimals=18),
+        data=_hex_to_bytes(data),
+    )
+    raw = client.call(tx)
+    (decoded,) = decode(["uint8"], raw)
+    return int(decoded)
+
+
+def _hex_to_bytes(value: str) -> bytes:
+    if not isinstance(value, str):
+        return b""
+    normalized = value[2:] if value.startswith("0x") else value
+    if normalized == "":
+        return b""
+    return bytes.fromhex(normalized)

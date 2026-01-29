@@ -39,6 +39,8 @@ source venv/bin/activate  # macOS/Linux
 ```bash
 make setup
 ```
+`make setup` also writes a `.pth` file so `src/` is on `PYTHONPATH` (enables
+`python -m pricing.*`, `from chain...`, `from core...` without extra setup).
 
 ### IDE setup (important)
 Mark `src/` as a **Sources Root** so imports like `from core...` and
