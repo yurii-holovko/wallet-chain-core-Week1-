@@ -468,6 +468,7 @@ pytest tests/test_uniswap_v2_pair.py
 pytest tests/test_route.py
 pytest tests/test_price_impact_analyzer.py
 pytest tests/test_mempool_monitor.py
+pytest tests/test_mainnet_uniswap_v2_swap.py
 ```
 
 ### Checklist (Week 2)
