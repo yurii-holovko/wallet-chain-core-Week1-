@@ -345,7 +345,6 @@ Test coverage:
 - [x] Analyzer: parsing, decoding, edge cases
 
 </details>
-
 <details>
 <summary><span style="font-size:1.25em"><strong>Week 2: Pricing</strong></span></summary>
 
@@ -484,4 +483,39 @@ pytest tests/test_mainnet_uniswap_v2_swap.py
 - Docs: architecture + examples
 
 
+</details>
+<details>
+<summary><span style="font-size:1.25em"><strong>Week 3: Exchange + Inventory</strong></span></summary>
+
+### Overview
+Week 3 integrates a CEX via `ccxt`, adds order book analytics, portfolio
+tracking across venues, and PnL + rebalance planning for arbitrage workflows.
+
+### Architecture
+```
+PricingEngine (Week 2) ──▶ ArbChecker ──▶ ExchangeClient (ccxt)
+                                       ├─▶ OrderBookAnalyzer
+                                       ├─▶ InventoryTracker
+                                       └─▶ PnLEngine / RebalancePlanner
+```
+
+### Modules
+- `src/exchange/client.py`: ccxt wrapper (order books, balances, orders, fees)
+- `src/exchange/orderbook.py`: order book analytics and slippage modeling
+- `src/inventory/tracker.py`: multi-venue inventory tracking
+- `src/inventory/pnl.py`: arb trade PnL tracking and summaries
+- `src/inventory/rebalancer.py`: rebalance planning (no execution)
+- `src/integration/arb_checker.py`: end-to-end arb opportunity checks
+
+### Setup
+Set Binance testnet credentials (see `env.example`):
+```powershell
+$env:BINANCE_TESTNET_API_KEY = "your_key_here"
+$env:BINANCE_TESTNET_SECRET = "your_secret_here"
+```
+
+`config.BINANCE_CONFIG` reads env vars via `config.get_env()` and enables the
+Binance sandbox + rate limiting by default.
+
+to be continued...
 </details>
