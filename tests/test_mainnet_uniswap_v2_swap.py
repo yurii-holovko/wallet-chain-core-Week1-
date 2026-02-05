@@ -77,18 +77,32 @@ def _find_recent_swap_log(client: ChainClient) -> dict | None:
     return None
 
 
-def _find_log(logs: list[dict], topic: str, address: Address) -> dict | None:
+def _matches_log(log: dict, topic: str, address: Address) -> bool:
     address_value = address.lower
     topic_value = f"0x{topic}".lower()
+    if str(log.get("address", "")).lower() != address_value:
+        return False
+    topics = log.get("topics") or []
+    if not topics:
+        return False
+    return str(topics[0]).lower() == topic_value
+
+
+def _find_swap_log(logs: list[dict], address: Address) -> dict | None:
     for log in logs:
-        if str(log.get("address", "")).lower() != address_value:
-            continue
-        topics = log.get("topics") or []
-        if not topics:
-            continue
-        if str(topics[0]).lower() == topic_value:
+        if _matches_log(log, SWAP_V2_TOPIC, address):
             return log
     return None
+
+
+def _call_pair_reserves_at_block(
+    client: ChainClient, pair: Address, block_number: int
+) -> tuple[int, int]:
+    block = hex(block_number)
+    data = _selector_hash("getReserves()")
+    raw = _call(client, pair, data, block=block)
+    reserve0, reserve1, _ = decode(["uint112", "uint112", "uint32"], raw)
+    return int(reserve0), int(reserve1)
 
 
 def test_mainnet_uniswap_v2_swap_matches_get_amount_out():
@@ -111,19 +125,21 @@ def test_mainnet_uniswap_v2_swap_matches_get_amount_out():
         pytest.skip("RPC error while fetching receipt")
     assert receipt is not None
 
-    swap_log = _find_log(receipt.logs, SWAP_V2_TOPIC, PAIR)
-    sync_log = _find_log(receipt.logs, SYNC_V2_TOPIC, PAIR)
+    swap_log = _find_swap_log(receipt.logs, PAIR)
     assert swap_log is not None, "Swap log missing in receipt"
-    assert sync_log is not None, "Sync log missing in receipt"
 
     amount0_in, amount1_in, amount0_out, amount1_out = decode(
         ["uint256", "uint256", "uint256", "uint256"],
         _hex_to_bytes(swap_log.get("data", "0x")),
     )
-    reserve0_after, reserve1_after = decode(
-        ["uint112", "uint112"],
-        _hex_to_bytes(sync_log.get("data", "0x")),
-    )
+    if receipt.block_number <= 0:
+        pytest.skip("Receipt block number missing")
+    try:
+        reserve0_before, reserve1_before = _call_pair_reserves_at_block(
+            client, PAIR, receipt.block_number - 1
+        )
+    except RPCError:
+        pytest.skip("RPC error while fetching reserves at block")
 
     try:
         token0_address = _call_address(client, PAIR, "token0()")
@@ -137,14 +153,10 @@ def test_mainnet_uniswap_v2_swap_matches_get_amount_out():
     if amount0_in > 0 and amount1_out > 0:
         amount_in = int(amount0_in)
         actual_out = int(amount1_out)
-        reserve0_before = int(reserve0_after) - amount_in
-        reserve1_before = int(reserve1_after) + actual_out
         token_in = token0
     elif amount1_in > 0 and amount0_out > 0:
         amount_in = int(amount1_in)
         actual_out = int(amount0_out)
-        reserve0_before = int(reserve0_after) + actual_out
-        reserve1_before = int(reserve1_after) - amount_in
         token_in = token1
     else:
         raise AssertionError("Unexpected swap amounts in log")
