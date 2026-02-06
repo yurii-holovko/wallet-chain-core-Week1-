@@ -621,7 +621,7 @@ python -m src.integration.arb_checker ETH/USDT --size 1 --log-csv arb.csv --log-
 - [x] README with architecture diagram showing module interactions
 
 ## Tests Must Cover
-- [ ] Order book parsing with real testnet data (tests use a fake exchange)
+- [x] Order book parsing with real testnet data (live integration test, skipped without keys)
 - [x] Walk-the-book with various sizes (small, large, insufficient)
 - [x] Inventory update after trades (buy/sell/fee deductions)
 - [x] Skew calculation with various distributions
