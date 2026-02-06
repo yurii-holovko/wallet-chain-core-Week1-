@@ -517,5 +517,34 @@ $env:BINANCE_TESTNET_SECRET = "your_secret_here"
 `config.BINANCE_CONFIG` reads env vars via `config.get_env()` and enables the
 Binance sandbox + rate limiting by default.
 
+### Stretch Goal CLIs
+Live order book (WebSocket):
+```bash
+python -m src.exchange.orderbook_ws ETH/USDT --ws-mode stream
+python -m src.exchange.orderbook_ws ETH/USDT --ws-mode api
+```
+
+Notes:
+- For mainnet streams, the REST snapshot runs without testnet keys; if you want
+  authenticated mainnet REST calls, set `BINANCE_API_KEY`/`BINANCE_SECRET`.
+- For testnet streams, pass `--testnet` and set
+  `BINANCE_TESTNET_API_KEY`/`BINANCE_TESTNET_SECRET`.
+- Enable debug logs with `ORDERBOOK_WS_DEBUG=1`.
+
+Inventory dashboard (use a balances file, not a keystore):
+```bash
+python -m inventory.dashboard --interval 5 --wallet-balances docs/examples/wallet_balances.json
+```
+
+Arb check with CSV logging:
+```bash
+python -m integration.arb_checker ETH/USDT --size 1 --log-csv arb.csv --log-min-bps 0
+```
+
+PnL chart export:
+```bash
+python -m inventory.pnl --export-chart pnl.png
+```
+
 to be continued...
 </details>

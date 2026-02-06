@@ -1,5 +1,6 @@
 import importlib
 import os
+from pathlib import Path
 
 _ENV_LOADED = False
 
@@ -14,7 +15,8 @@ def _load_env() -> None:
         raise SystemExit(
             "python-dotenv is required (pip install -r requirements.txt)"
         ) from exc
-    dotenv.load_dotenv()
+    env_path = Path(__file__).resolve().parent / ".env"
+    dotenv.load_dotenv(dotenv_path=env_path)
     _ENV_LOADED = True
 
 

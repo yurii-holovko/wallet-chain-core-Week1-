@@ -172,6 +172,7 @@ class ExchangeClient:
         best_ask = asks[0] if asks else None
         mid_price = None
         spread_bps = None
+        last_update_id = raw.get("nonce") or raw.get("lastUpdateId")
         if best_bid and best_ask:
             mid_price = (best_bid[0] + best_ask[0]) / Decimal("2")
             if mid_price != 0:
@@ -179,6 +180,7 @@ class ExchangeClient:
         return {
             "symbol": symbol,
             "timestamp": raw.get("timestamp"),
+            "last_update_id": last_update_id,
             "bids": bids,
             "asks": asks,
             "best_bid": best_bid,
