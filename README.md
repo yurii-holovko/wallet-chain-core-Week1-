@@ -507,6 +507,26 @@ PricingEngine (Week 2) ──▶ ArbChecker ──▶ ExchangeClient (ccxt)
 - `src/inventory/rebalancer.py`: rebalance planning (no execution)
 - `src/integration/arb_checker.py`: end-to-end arb opportunity checks
 
+### Architecture
+```
+┌──────────────┐     ┌─────────────────┐     ┌──────────────────────┐
+│ Pricing      │────▶│ ArbChecker      │────▶│ InventoryTracker     │
+│ (Uniswap V2) │     │ (decision core) │     │ + RebalancePlanner   │
+└──────┬───────┘     └───────┬─────────┘     └──────────┬───────────┘
+       │                     │                            │
+       │                     │                            │
+┌──────▼────────┐     ┌──────▼──────────┐        ┌────────▼─────────┐
+│ ChainClient   │     │ ExchangeClient  │        │ PnLEngine         │
+│ (RPC/tx)      │     │ (Binance)       │        │ (trades, charts)  │
+└───────────────┘     └──────┬──────────┘        └──────────────────┘
+                             │
+                             │
+                      ┌──────▼─────────┐
+                      │ OrderBook      │
+                      │ Analyzer + WS  │
+                      └────────────────┘
+```
+
 ### Setup
 Set Binance testnet credentials (see `env.example`):
 ```powershell
@@ -545,6 +565,39 @@ PnL chart export:
 ```bash
 python -m inventory.pnl --export-chart pnl.png
 ```
+
+### Definition of Done
+## Required (all must pass)
+- [x] `ExchangeClient` connects to Binance testnet and fetches order books
+- [x] `ExchangeClient` places and cancels LIMIT IOC orders
+- [x] Rate limiter prevents API ban
+- [x] `OrderBookAnalyzer.walk_the_book` simulates fills correctly
+- [x] `OrderBookAnalyzer` CLI shows depth, spread, imbalance
+- [x] `InventoryTracker` aggregates balances across venues
+- [x] `InventoryTracker.can_execute` validates both legs before trade
+- [x] `InventoryTracker.skew` detects imbalanced positions
+- [x] `RebalancePlanner` generates valid transfer plans
+- [x] `RebalancePlanner` respects min operating balances
+- [x] `PnLEngine` tracks per-trade and aggregate PnL correctly
+- [x] `ArbChecker` integrates pricing (Week 2) + exchange + inventory
+- [x] Minimum 25 tests covering edge cases (current: 70+ unit tests)
+- [x] README with architecture diagram showing module interactions
+
+## Tests Must Cover
+- [ ] Order book parsing with real testnet data (tests use a fake exchange)
+- [x] Walk-the-book with various sizes (small, large, insufficient)
+- [x] Inventory update after trades (buy/sell/fee deductions)
+- [x] Skew calculation with various distributions
+- [x] Rebalance plan generation with fee accounting
+- [x] PnL calculation with real fee structures
+- [ ] Integration: arb check passes when profitable, rejects when not
+
+## Stretch Goals
+- [x] WebSocket-based order book with incremental updates (+10)
+- [ ] Multi-exchange support (add Bybit testnet via ccxt) (+10)
+- [x] Real-time inventory dashboard (terminal UI) (+5)
+- [x] Historical PnL chart export (matplotlib/plotly) (+5)
+- [x] Arb opportunity logger with CSV export (+5)
 
 to be continued...
 </details>
