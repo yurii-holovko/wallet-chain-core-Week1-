@@ -177,9 +177,12 @@ class ExchangeClient:
             mid_price = (best_bid[0] + best_ask[0]) / Decimal("2")
             if mid_price != 0:
                 spread_bps = (best_ask[0] - best_bid[0]) / mid_price * Decimal("10000")
+        timestamp = raw.get("timestamp")
+        if timestamp is None:
+            timestamp = int(time.time() * 1000)
         return {
             "symbol": symbol,
-            "timestamp": raw.get("timestamp"),
+            "timestamp": timestamp,
             "last_update_id": last_update_id,
             "bids": bids,
             "asks": asks,
