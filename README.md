@@ -571,6 +571,15 @@ Arb checker (real prices):
 python -m src.integration.arb_checker ETH/USDT --size 1 --gas-usd 5 --balances docs/examples/wallet_balances.json
 ```
 
+Arb checker (marginal-size optimization):
+```bash
+python -m src.integration.arb_checker ETH/USDT --size 2 --step 0.1 --gas-usd 5 --balances docs/examples/wallet_balances.json
+```
+Notes:
+- Uses marginal slice pricing on DEX/CEX order books to find the optimal size.
+- Stops when the next slice becomes unprofitable; gas is amortized across slices.
+- DEX fee + price impact are already included in AMM execution prices.
+
 PnL report (5 trades):
 ```bash
 python -m src.inventory.pnl --summary --trades docs/examples/pnl_trades.json

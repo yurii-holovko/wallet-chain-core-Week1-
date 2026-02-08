@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
+from typing import List
 
 import config
 from chain.client import ChainClient
@@ -21,6 +22,38 @@ PAIR_POOLS = {
     "ETH/USDT": "0x0d4a11d5eeaac28ec3f61d100daf4d40471f1852",
     "ETH/USDC": "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc",
 }
+
+
+@dataclass
+class SliceResult:
+    """One incremental slice of the order."""
+
+    slice_index: int
+    slice_size: Decimal  # base amount of this slice
+    cumulative_size: Decimal  # total base so far
+    marginal_dex_price: Decimal  # DEX price for THIS slice only
+    marginal_cex_price: Decimal  # CEX price for THIS slice only
+    marginal_gap_bps: Decimal  # gap for this slice
+    marginal_costs_bps: Decimal  # costs for this slice
+    marginal_net_pnl_bps: Decimal  # net PnL for this slice
+    cumulative_net_pnl_usd: Decimal  # total USD PnL up to this slice
+    profitable: bool  # is this slice profitable on its own?
+
+
+@dataclass
+class OptimalSizeResult:
+    """Result of incremental size optimization."""
+
+    direction: str
+    optimal_size: Decimal  # best size that maximizes total PnL
+    max_size_requested: Decimal  # original size the user asked for
+    total_net_pnl_usd: Decimal  # total USD PnL at optimal size
+    total_net_pnl_bps: Decimal  # total PnL in bps at optimal size
+    avg_buy_price: Decimal  # volume-weighted avg buy price
+    avg_sell_price: Decimal  # volume-weighted avg sell price
+    slices: List[SliceResult] = field(default_factory=list)
+    profitable_slices: int = 0
+    total_slices: int = 0
 
 
 @dataclass
@@ -59,9 +92,22 @@ class ArbChecker:
         self._pnl = pnl_engine
         self._gas_cost_usd = gas_cost_usd
 
-    def check(self, pair: str, size: Decimal) -> dict:
+    def check(
+        self,
+        pair: str,
+        size: Decimal,
+        optimize: bool = True,
+        step: Decimal | None = None,
+    ) -> dict:
         """
         Full arb check for a trading pair.
+
+        When optimize=True (default), uses incremental marginal-price
+        optimization: grows the order slice-by-slice and stops when the
+        marginal slice is no longer profitable.  The returned size may be
+        smaller than the requested `size`.
+
+        `step` controls the granularity of each slice (default: size / 20).
         """
         base_symbol, quote_symbol = _split_pair(pair)
         pool = _resolve_pool(self._pricing_engine, base_symbol, quote_symbol)
@@ -76,18 +122,18 @@ class ArbChecker:
         cex_bid = best_bid[0]
         cex_ask = best_ask[0]
 
+        cex_fee = _cex_fee_bps(self._exchange_client, pair)
+        dex_fee_bps = Decimal("30")
+
+        # --- flat (legacy) metrics for both directions ---
         dex_buy_price, dex_buy_impact_bps = _dex_buy_price(
             pool, base_token, quote_token, size
         )
         dex_sell_price, dex_sell_impact_bps = _dex_sell_price(
             pool, base_token, quote_token, size
         )
-
         cex_sell_slippage = analyzer.walk_the_book("sell", float(size))["slippage_bps"]
         cex_buy_slippage = analyzer.walk_the_book("buy", float(size))["slippage_bps"]
-
-        cex_fee_bps = _cex_fee_bps(self._exchange_client, pair)
-        dex_fee_bps = Decimal("30")
 
         buy_dex_sell_cex = _direction_metrics(
             direction="buy_dex_sell_cex",
@@ -95,7 +141,7 @@ class ArbChecker:
             sell_price=cex_bid,
             dex_impact_bps=dex_buy_impact_bps,
             cex_slippage_bps=cex_sell_slippage,
-            cex_fee_bps=cex_fee_bps,
+            cex_fee_bps=cex_fee,
             dex_fee_bps=dex_fee_bps,
             gas_cost_usd=self._gas_cost_usd,
             size=size,
@@ -106,15 +152,99 @@ class ArbChecker:
             sell_price=dex_sell_price,
             dex_impact_bps=dex_sell_impact_bps,
             cex_slippage_bps=cex_buy_slippage,
-            cex_fee_bps=cex_fee_bps,
+            cex_fee_bps=cex_fee,
             dex_fee_bps=dex_fee_bps,
             gas_cost_usd=self._gas_cost_usd,
             size=size,
         )
 
-        chosen = max(
+        chosen_flat = max(
             [buy_dex_sell_cex, buy_cex_sell_dex],
             key=lambda item: item["estimated_net_pnl_bps"],
+        )
+
+        # --- optimal-size via marginal pricing ---
+        optimal_result: OptimalSizeResult | None = None
+        effective_size = size
+        effective_direction = chosen_flat["direction"]
+
+        if optimize:
+            if step is None:
+                step = size / Decimal("20")
+                if step <= 0:
+                    step = size
+
+            bid_levels = orderbook.get("bids", [])
+            ask_levels = orderbook.get("asks", [])
+
+            opt_buy_dex = find_optimal_size(
+                pool=pool,
+                base_token=base_token,
+                quote_token=quote_token,
+                direction="buy_dex_sell_cex",
+                cex_levels=bid_levels,
+                max_size=size,
+                step=step,
+                cex_fee_bps=cex_fee,
+                dex_fee_bps=dex_fee_bps,
+                gas_cost_usd=self._gas_cost_usd,
+            )
+            opt_buy_cex = find_optimal_size(
+                pool=pool,
+                base_token=base_token,
+                quote_token=quote_token,
+                direction="buy_cex_sell_dex",
+                cex_levels=ask_levels,
+                max_size=size,
+                step=step,
+                cex_fee_bps=cex_fee,
+                dex_fee_bps=dex_fee_bps,
+                gas_cost_usd=self._gas_cost_usd,
+            )
+
+            optimal_result = max(
+                [opt_buy_dex, opt_buy_cex],
+                key=lambda r: r.total_net_pnl_usd,
+            )
+            effective_size = optimal_result.optimal_size
+            effective_direction = optimal_result.direction
+
+        # Recompute flat metrics at effective_size for the report
+        if optimize and effective_size > 0 and effective_size != size:
+            dex_buy_price, dex_buy_impact_bps = _dex_buy_price(
+                pool, base_token, quote_token, effective_size
+            )
+            dex_sell_price, dex_sell_impact_bps = _dex_sell_price(
+                pool, base_token, quote_token, effective_size
+            )
+            cex_sell_slippage = analyzer.walk_the_book("sell", float(effective_size))[
+                "slippage_bps"
+            ]
+            cex_buy_slippage = analyzer.walk_the_book("buy", float(effective_size))[
+                "slippage_bps"
+            ]
+
+        if effective_direction == "buy_dex_sell_cex":
+            chosen_impact = dex_buy_impact_bps
+            chosen_slippage = cex_sell_slippage
+            chosen_buy = dex_buy_price
+            chosen_sell = cex_bid
+        else:
+            chosen_impact = dex_sell_impact_bps
+            chosen_slippage = cex_buy_slippage
+            chosen_buy = cex_ask
+            chosen_sell = dex_sell_price
+
+        chosen = _direction_metrics(
+            direction=effective_direction,
+            buy_price=chosen_buy,
+            sell_price=chosen_sell,
+            dex_impact_bps=chosen_impact,
+            cex_slippage_bps=chosen_slippage,
+            cex_fee_bps=cex_fee,
+            dex_fee_bps=dex_fee_bps,
+            gas_cost_usd=self._gas_cost_usd,
+            size=effective_size if effective_size > 0 else size,
         )
 
         inventory_ok, inventory_details = _inventory_check(
@@ -122,13 +252,15 @@ class ArbChecker:
             chosen["direction"],
             base_symbol,
             quote_symbol,
-            size,
+            effective_size if effective_size > 0 else size,
             chosen["buy_price"],
         )
 
-        executable = inventory_ok and chosen["estimated_net_pnl_bps"] > 0
+        executable = (
+            inventory_ok and chosen["estimated_net_pnl_bps"] > 0 and effective_size > 0
+        )
 
-        return {
+        result = {
             "pair": pair,
             "timestamp": datetime.now(timezone.utc),
             "dex_buy_price": dex_buy_price,
@@ -141,10 +273,12 @@ class ArbChecker:
             "estimated_net_pnl_bps": chosen["estimated_net_pnl_bps"],
             "inventory_ok": inventory_ok,
             "executable": executable,
+            "requested_size": size,
+            "effective_size": effective_size,
             "details": {
                 "dex_price_impact_bps": chosen["dex_impact_bps"],
                 "cex_slippage_bps": chosen["cex_slippage_bps"],
-                "cex_fee_bps": cex_fee_bps,
+                "cex_fee_bps": cex_fee,
                 "dex_fee_bps": dex_fee_bps,
                 "gas_cost_usd": self._gas_cost_usd,
                 "gas_cost_bps": chosen["gas_cost_bps"],
@@ -152,7 +286,26 @@ class ArbChecker:
                 "sell_price": chosen["sell_price"],
                 **inventory_details,
             },
+            "directions": {
+                "buy_dex_sell_cex": buy_dex_sell_cex,
+                "buy_cex_sell_dex": buy_cex_sell_dex,
+            },
         }
+
+        if optimal_result is not None:
+            result["optimization"] = {
+                "direction": optimal_result.direction,
+                "optimal_size": optimal_result.optimal_size,
+                "total_net_pnl_usd": optimal_result.total_net_pnl_usd,
+                "total_net_pnl_bps": optimal_result.total_net_pnl_bps,
+                "avg_buy_price": optimal_result.avg_buy_price,
+                "avg_sell_price": optimal_result.avg_sell_price,
+                "profitable_slices": optimal_result.profitable_slices,
+                "total_slices": optimal_result.total_slices,
+                "slices": optimal_result.slices,
+            }
+
+        return result
 
 
 def _split_pair(pair: str) -> tuple[str, str]:
@@ -231,6 +384,239 @@ def _dex_sell_price(
     return price, impact
 
 
+def _marginal_dex_buy_price(
+    pool: UniswapV2Pair, base: Token, quote: Token, step_size: Decimal
+) -> tuple[Decimal, UniswapV2Pair]:
+    """
+    Marginal DEX buy price: how much quote we pay for `step_size` base
+    on the CURRENT pool state. Returns (price_per_base, updated_pool).
+    """
+    base_raw = _to_raw(step_size, base.decimals)
+    if base_raw <= 0:
+        return Decimal("0"), pool
+    quote_raw = pool.get_amount_in(base_raw, token_out=base)
+    quote_amount = _from_raw(quote_raw, quote.decimals)
+    price = quote_amount / step_size
+    # simulate the swap: we send quote_raw in, get base_raw out
+    # For get_amount_in, the "token_in" is quote (we pay quote to receive base)
+    updated_pool = pool.simulate_swap(quote_raw, token_in=quote)
+    return price, updated_pool
+
+
+def _marginal_dex_sell_price(
+    pool: UniswapV2Pair, base: Token, quote: Token, step_size: Decimal
+) -> tuple[Decimal, UniswapV2Pair]:
+    """
+    Marginal DEX sell price: how much quote we receive for `step_size` base
+    on the CURRENT pool state. Returns (price_per_base, updated_pool).
+    """
+    base_raw = _to_raw(step_size, base.decimals)
+    if base_raw <= 0:
+        return Decimal("0"), pool
+    quote_raw = pool.get_amount_out(base_raw, token_in=base)
+    quote_amount = _from_raw(quote_raw, quote.decimals)
+    price = quote_amount / step_size
+    updated_pool = pool.simulate_swap(base_raw, token_in=base)
+    return price, updated_pool
+
+
+def _marginal_cex_price(
+    levels: list[tuple[Decimal, Decimal]],
+    already_consumed: Decimal,
+    step_size: Decimal,
+) -> Decimal:
+    """
+    Marginal CEX price for the next `step_size` base, given that
+    `already_consumed` base has already been eaten from the book.
+    Returns volume-weighted avg price for this slice.
+    """
+    skipped = Decimal("0")
+    remaining = step_size
+    total_cost = Decimal("0")
+    total_filled = Decimal("0")
+
+    for price, level_qty in levels:
+        if remaining <= 0:
+            break
+        # skip already consumed volume
+        available = level_qty - max(Decimal("0"), already_consumed - skipped)
+        skipped += level_qty
+        if available <= 0:
+            continue
+        take = min(remaining, available)
+        total_cost += take * price
+        total_filled += take
+        remaining -= take
+
+    if total_filled <= 0:
+        return Decimal("0")
+    return total_cost / total_filled
+
+
+def find_optimal_size(
+    pool: UniswapV2Pair,
+    base_token: Token,
+    quote_token: Token,
+    direction: str,
+    cex_levels: list[tuple[Decimal, Decimal]],
+    max_size: Decimal,
+    step: Decimal,
+    cex_fee_bps: Decimal = Decimal("10"),
+    dex_fee_bps: Decimal = Decimal("30"),
+    gas_cost_usd: Decimal = Decimal("5"),
+) -> OptimalSizeResult:
+    """
+    Incrementally grow the order by `step` until the marginal slice
+    becomes unprofitable.
+
+    For direction="buy_dex_sell_cex":
+      - Each slice BUYS `step` base on DEX (marginal DEX buy price)
+      - Each slice SELLS `step` base on CEX (marginal CEX bid price)
+      - Marginal PnL = (cex_sell - dex_buy) * step  minus  marginal costs
+
+    For direction="buy_cex_sell_dex":
+      - Each slice BUYS `step` base on CEX (marginal CEX ask price)
+      - Each slice SELLS `step` base on DEX (marginal DEX sell price)
+
+    We stop when marginal PnL <= 0 or we hit max_size.
+    Returns the optimal size (sum of profitable slices) and details.
+    """
+    if step <= 0:
+        raise ValueError("step must be positive")
+    if max_size <= 0:
+        raise ValueError("max_size must be positive")
+
+    slices: list[SliceResult] = []
+    current_pool = pool
+    consumed_cex = Decimal("0")
+    cumulative_size = Decimal("0")
+    cumulative_pnl_usd = Decimal("0")
+    best_pnl_usd = Decimal("0")
+    best_size = Decimal("0")
+    total_buy_cost = Decimal("0")
+    total_sell_revenue = Decimal("0")
+    best_buy_cost = Decimal("0")
+    best_sell_revenue = Decimal("0")
+
+    # Gas is a FIXED cost — it does not depend on trade size.
+    # We evaluate each marginal slice WITHOUT gas, then subtract gas
+    # from the cumulative PnL.  The optimal size is where
+    # cumulative_gross_pnl - gas is maximised and > 0.
+
+    slice_index = 0
+    while cumulative_size + step <= max_size + step / 2:
+        actual_step = min(step, max_size - cumulative_size)
+        if actual_step <= 0:
+            break
+
+        if direction == "buy_dex_sell_cex":
+            marginal_buy, updated_pool = _marginal_dex_buy_price(
+                current_pool, base_token, quote_token, actual_step
+            )
+            marginal_sell = _marginal_cex_price(cex_levels, consumed_cex, actual_step)
+        elif direction == "buy_cex_sell_dex":
+            marginal_buy = _marginal_cex_price(cex_levels, consumed_cex, actual_step)
+            marginal_sell, updated_pool = _marginal_dex_sell_price(
+                current_pool, base_token, quote_token, actual_step
+            )
+        else:
+            raise ValueError(f"Unknown direction: {direction}")
+
+        if marginal_buy <= 0 or marginal_sell <= 0:
+            break  # no more liquidity
+
+        # Marginal gap for this slice
+        marginal_gap = marginal_sell - marginal_buy
+        marginal_gap_bps = (
+            marginal_gap / marginal_buy * Decimal("10000")
+            if marginal_buy > 0
+            else Decimal("0")
+        )
+
+        # Marginal costs: only CEX fee.
+        # DEX fee is already baked into the AMM price.
+        # Gas is NOT per-slice — it is subtracted from cumulative total.
+        slice_cost_bps = cex_fee_bps
+        marginal_net_pnl_bps = marginal_gap_bps - slice_cost_bps
+
+        # USD PnL for this slice (before gas)
+        slice_pnl_usd = marginal_gap * actual_step - (
+            slice_cost_bps / Decimal("10000") * marginal_buy * actual_step
+        )
+
+        cumulative_size += actual_step
+        cumulative_pnl_usd += slice_pnl_usd
+        consumed_cex += actual_step
+
+        buy_cost_slice = marginal_buy * actual_step
+        sell_revenue_slice = marginal_sell * actual_step
+        total_buy_cost += buy_cost_slice
+        total_sell_revenue += sell_revenue_slice
+
+        # A slice is "profitable" if its own marginal PnL > 0 (ignoring gas)
+        is_profitable = marginal_net_pnl_bps > 0
+
+        # cumulative PnL AFTER gas
+        cum_net_after_gas = cumulative_pnl_usd - gas_cost_usd
+
+        sr = SliceResult(
+            slice_index=slice_index,
+            slice_size=actual_step,
+            cumulative_size=cumulative_size,
+            marginal_dex_price=(
+                marginal_buy if direction == "buy_dex_sell_cex" else marginal_sell
+            ),
+            marginal_cex_price=(
+                marginal_sell if direction == "buy_dex_sell_cex" else marginal_buy
+            ),
+            marginal_gap_bps=marginal_gap_bps,
+            marginal_costs_bps=slice_cost_bps,
+            marginal_net_pnl_bps=marginal_net_pnl_bps,
+            cumulative_net_pnl_usd=cum_net_after_gas,
+            profitable=is_profitable,
+        )
+        slices.append(sr)
+
+        # Track the best cumulative PnL point (after gas)
+        if cum_net_after_gas > best_pnl_usd:
+            best_pnl_usd = cum_net_after_gas
+            best_size = cumulative_size
+            best_buy_cost = total_buy_cost
+            best_sell_revenue = total_sell_revenue
+
+        # Update pool state for next iteration
+        current_pool = updated_pool
+
+        slice_index += 1
+
+        # Early stop: if last N slices are all unprofitable, no point continuing
+        if len(slices) >= 3 and all(not s.profitable for s in slices[-3:]):
+            break
+
+    profitable_count = sum(1 for s in slices if s.profitable)
+
+    avg_buy = best_buy_cost / best_size if best_size > 0 else Decimal("0")
+    avg_sell = best_sell_revenue / best_size if best_size > 0 else Decimal("0")
+    total_bps = (
+        (avg_sell - avg_buy) / avg_buy * Decimal("10000")
+        if avg_buy > 0
+        else Decimal("0")
+    )
+
+    return OptimalSizeResult(
+        direction=direction,
+        optimal_size=best_size,
+        max_size_requested=max_size,
+        total_net_pnl_usd=best_pnl_usd,
+        total_net_pnl_bps=total_bps,
+        avg_buy_price=avg_buy,
+        avg_sell_price=avg_sell,
+        slices=slices,
+        profitable_slices=profitable_count,
+        total_slices=len(slices),
+    )
+
+
 def _cex_fee_bps(exchange: ExchangeClient, symbol: str) -> Decimal:
     try:
         fees = exchange.get_trading_fees(symbol)
@@ -257,9 +643,11 @@ def _direction_metrics(
         if buy_price > 0
         else Decimal("0")
     )
-    total_costs_bps = (
-        dex_fee_bps + dex_impact_bps + cex_fee_bps + cex_slippage_bps + gas_cost_bps
-    )
+    # NOTE: neither dex_fee_bps nor dex_impact_bps are added here because
+    # the AMM formula (get_amount_in / get_amount_out) already incorporates
+    # BOTH the 0.3% swap fee AND the price impact into the execution price.
+    # Adding them would double-count.
+    total_costs_bps = cex_fee_bps + cex_slippage_bps + gas_cost_bps
     net_pnl_bps = gap_bps - total_costs_bps
     return {
         "direction": direction,
@@ -360,46 +748,134 @@ def _build_tracker(data: dict) -> InventoryTracker:
     return tracker
 
 
+def _dir_label(direction: str) -> str:
+    if direction == "buy_dex_sell_cex":
+        return "Buy DEX -> Sell CEX"
+    if direction == "buy_cex_sell_dex":
+        return "Buy CEX -> Sell DEX"
+    return direction
+
+
 def _print_report(result: dict, size: Decimal) -> None:
-    print("=" * 43)
     base_symbol = result["pair"].split("/")[0]
     quote_symbol = result["pair"].split("/")[1]
+    effective_size = result.get("effective_size", size)
+    requested_size = result.get("requested_size", size)
+
+    print("=" * 60)
     print(
-        "  ARB CHECK: "
-        f"{result['pair']} (size: {_format_decimal(size, 2)} {base_symbol})"
+        f"  ARB CHECK: {result['pair']}  "
+        f"size={_format_decimal(effective_size, 4)} {base_symbol}"
     )
-    print("=" * 43)
+    if effective_size != requested_size:
+        print(
+            f"  (requested {_format_decimal(requested_size, 4)}, "
+            f"optimized to {_format_decimal(effective_size, 4)})"
+        )
+    print("=" * 60)
+
+    # --- Market prices ---
     print("")
-    print("Prices:")
-    print(f"  Uniswap V2:      ${_format_decimal(result['dex_buy_price'])}")
-    print(f"  Binance bid:      ${_format_decimal(result['cex_bid'])}")
+    print("Market prices (at requested size):")
+    print(f"  DEX buy  (Uniswap): ${_format_decimal(result['dex_buy_price'])}")
+    print(f"  DEX sell (Uniswap): ${_format_decimal(result['dex_sell_price'])}")
+    print(f"  CEX bid  (Binance): ${_format_decimal(result['cex_bid'])}")
+    print(f"  CEX ask  (Binance): ${_format_decimal(result['cex_ask'])}")
+
+    # --- Both directions summary ---
+    dirs = result.get("directions")
+    if dirs:
+        print("")
+        print("Direction comparison (flat, before optimization):")
+        for key in ("buy_dex_sell_cex", "buy_cex_sell_dex"):
+            d = dirs.get(key)
+            if d is None:
+                continue
+            label = _dir_label(key)
+            gap = _format_decimal(d["gap_bps"])
+            costs = _format_decimal(d["estimated_costs_bps"])
+            net = _format_decimal(d["estimated_net_pnl_bps"])
+            marker = " <-- best" if key == result["direction"] else ""
+            print(f"  {label}:")
+            print(
+                f"    buy=${_format_decimal(d['buy_price'])}  "
+                f"sell=${_format_decimal(d['sell_price'])}  "
+                f"gap={gap} bps  costs={costs} bps  net={net} bps{marker}"
+            )
+
+    # --- Chosen direction details ---
     print("")
-    gap_value = result["cex_bid"] - result["dex_buy_price"]
-    print(
-        f"Gap: ${_format_decimal(gap_value)} ({_format_decimal(result['gap_bps'])} bps)"
-    )
+    chosen_dir = result["direction"]
+    print(f"Chosen direction: {_dir_label(chosen_dir)}")
     print("")
-    print("Costs:")
-    print(
-        f"  DEX fee:           {_format_decimal(result['details']['dex_fee_bps'])} bps"
-    )
-    dex_impact = _format_decimal(result["details"]["dex_price_impact_bps"])
-    print(f"  DEX price impact:   {dex_impact} bps")
+    print("Costs breakdown:")
+    print("  DEX fee + impact:  (included in AMM execution price)")
     print(
         f"  CEX fee:           {_format_decimal(result['details']['cex_fee_bps'])} bps"
     )
     cex_slippage = _format_decimal(result["details"]["cex_slippage_bps"])
-    print(f"  CEX slippage:       {cex_slippage} bps")
+    print(f"  CEX slippage:      {cex_slippage} bps")
     print(
         f"  Gas:               ${_format_decimal(result['details']['gas_cost_usd'])} "
         f"({_format_decimal(result['details']['gas_cost_bps'])} bps)"
     )
-    print("  " + "-" * 24)
+    print("  " + "-" * 30)
     print(f"  Total costs:       {_format_decimal(result['estimated_costs_bps'])} bps")
     print("")
-    verdict = "PROFITABLE" if result["estimated_net_pnl_bps"] > 0 else "NOT PROFITABLE"
+    gap_bps = _format_decimal(result["gap_bps"])
     net_pnl = _format_decimal(result["estimated_net_pnl_bps"])
-    print(f"Net PnL estimate: {net_pnl} bps {verdict}")
+    verdict = "PROFITABLE" if result["estimated_net_pnl_bps"] > 0 else "NOT PROFITABLE"
+    print(f"Gap: {gap_bps} bps   Net PnL: {net_pnl} bps   {verdict}")
+
+    # --- Optimization details ---
+    opt = result.get("optimization")
+    if opt is not None:
+        print("")
+        print("-" * 60)
+        opt_dir = opt.get("direction", chosen_dir)
+        print(f"  Marginal-price optimization ({_dir_label(opt_dir)}):")
+        print(
+            f"  Optimal size:     "
+            f"{_format_decimal(opt['optimal_size'], 4)} {base_symbol}"
+        )
+        print(
+            f"  Total PnL:        "
+            f"${_format_decimal(opt['total_net_pnl_usd'])} "
+            f"({_format_decimal(opt['total_net_pnl_bps'])} bps)  "
+            f"[gas ${_format_decimal(result['details']['gas_cost_usd'])} subtracted]"
+        )
+        print(f"  Avg buy price:    ${_format_decimal(opt['avg_buy_price'])}")
+        print(f"  Avg sell price:   ${_format_decimal(opt['avg_sell_price'])}")
+        print(
+            f"  Profitable slices: " f"{opt['profitable_slices']}/{opt['total_slices']}"
+        )
+
+        slices = opt.get("slices", [])
+        if slices:
+            print("")
+            print(f"  Slice breakdown ({_dir_label(opt_dir)}):")
+            print(
+                f"  {'#':>3}  {'size':>8}  {'cum.size':>8}  "
+                f"{'m.buy':>10}  {'m.sell':>10}  "
+                f"{'gap_bps':>8}  {'net_bps':>8}  "
+                f"{'cum.$':>10}  {'ok':>3}"
+            )
+            for s in slices:
+                mark = "+" if s.profitable else "-"
+                print(
+                    f"  {s.slice_index:>3}  "
+                    f"{_format_decimal(s.slice_size, 4):>8}  "
+                    f"{_format_decimal(s.cumulative_size, 4):>8}  "
+                    f"{_format_decimal(s.marginal_dex_price):>10}  "
+                    f"{_format_decimal(s.marginal_cex_price):>10}  "
+                    f"{_format_decimal(s.marginal_gap_bps):>8}  "
+                    f"{_format_decimal(s.marginal_net_pnl_bps):>8}  "
+                    f"{_format_decimal(s.cumulative_net_pnl_usd):>10}  "
+                    f"  {mark}"
+                )
+        print("-" * 60)
+
+    # --- Inventory ---
     print("")
     print("Inventory:")
     buy_asset = result["details"].get("buy_asset", quote_symbol)
@@ -413,11 +889,13 @@ def _print_report(result: dict, size: Decimal) -> None:
     buy_venue = result["details"].get("buy_venue", Venue.WALLET).value
     sell_venue = result["details"].get("sell_venue", Venue.BINANCE).value
     print(
-        f"  {buy_venue.title()} {buy_asset}:  {_format_decimal(buy_available)} "
+        f"  {buy_venue.title()} {buy_asset}:  "
+        f"{_format_decimal(buy_available)} "
         f"(need ~{_format_decimal(buy_needed)}) {buy_ok}"
     )
     print(
-        f"  {sell_venue.title()} {sell_asset}:   {_format_decimal(sell_available)} "
+        f"  {sell_venue.title()} {sell_asset}:   "
+        f"{_format_decimal(sell_available)} "
         f"(need {_format_decimal(sell_needed)}) {sell_ok}"
     )
     print("")
@@ -425,7 +903,7 @@ def _print_report(result: dict, size: Decimal) -> None:
         "EXECUTE" if result["executable"] else "SKIP - costs exceed gap or inventory"
     )
     print(f"Verdict: {verdict_line}")
-    print("=" * 43)
+    print("=" * 60)
 
 
 def _append_arb_log(
@@ -503,6 +981,17 @@ def main() -> None:
         action="store_true",
         help="Log only opportunities that pass inventory checks",
     )
+    parser.add_argument(
+        "--no-optimize",
+        action="store_true",
+        help="Disable marginal-price size optimization (use flat size)",
+    )
+    parser.add_argument(
+        "--step",
+        type=float,
+        default=None,
+        help="Slice step size for optimization (default: size/20)",
+    )
     args = parser.parse_args()
 
     rpc_url = config.get_env("RPC_URL", required=True)
@@ -525,7 +1014,14 @@ def main() -> None:
         PnLEngine(),
         gas_cost_usd=Decimal(str(args.gas_usd)),
     )
-    result = checker.check(args.pair, Decimal(str(args.size)))
+    optimize = not args.no_optimize
+    step = Decimal(str(args.step)) if args.step is not None else None
+    result = checker.check(
+        args.pair,
+        Decimal(str(args.size)),
+        optimize=optimize,
+        step=step,
+    )
     _print_report(result, Decimal(str(args.size)))
     if args.log_csv:
         _append_arb_log(

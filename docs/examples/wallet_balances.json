@@ -1,4 +1,16 @@
 {
-  "USDT": "15000",
-  "ETH": "0"
+  "wallet": {
+    "USDT": "15000",
+    "ETH": "0"
+  },
+  "binance": {
+    "USDT": {
+      "free": "25000",
+      "locked": "0"
+    },
+    "ETH": {
+      "free": "1.0",
+      "locked": "0"
+    }
+  }
 }
