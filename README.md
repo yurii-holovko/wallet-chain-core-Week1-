@@ -636,7 +636,7 @@ python -m src.integration.arb_checker ETH/USDT --size 1 --log-csv arb.csv --log-
 - [x] Skew calculation with various distributions
 - [x] Rebalance plan generation with fee accounting
 - [x] PnL calculation with real fee structures
-- [ ] Integration: arb check passes when profitable, rejects when not
+- [x] Integration: arb check passes when profitable, rejects when not
 
 ## Stretch Goals
 - [x] WebSocket-based order book with incremental updates (+10)

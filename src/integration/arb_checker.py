@@ -256,9 +256,15 @@ class ArbChecker:
             chosen["buy_price"],
         )
 
-        executable = (
-            inventory_ok and chosen["estimated_net_pnl_bps"] > 0 and effective_size > 0
-        )
+        # When optimization is active, use the optimizer's USD PnL (which
+        # accounts for gas as a fixed cost) instead of the flat bps metric
+        # whose gas-per-unit accounting can diverge at small sizes.
+        if optimize and optimal_result is not None:
+            is_profitable = optimal_result.total_net_pnl_usd > 0
+        else:
+            is_profitable = chosen["estimated_net_pnl_bps"] > 0
+
+        executable = inventory_ok and is_profitable and effective_size > 0
 
         result = {
             "pair": pair,
