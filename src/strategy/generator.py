@@ -146,6 +146,8 @@ class SignalGenerator:
             meta={
                 "cex_bid": prices["cex_bid"],
                 "cex_ask": prices["cex_ask"],
+                "cex_bid_depth": prices.get("cex_bid_depth", 0.0),
+                "cex_ask_depth": prices.get("cex_ask_depth", 0.0),
                 "dex_buy": prices["dex_buy"],
                 "dex_sell": prices["dex_sell"],
                 "breakeven_bps": round(total_fee_bps, 2),
@@ -202,18 +204,27 @@ class SignalGenerator:
         # ExchangeClient returns (Decimal, Decimal) tuples — cast to float
         cex_bid = float(bids[0][0])
         cex_ask = float(asks[0][0])
+        # Volume at top-of-book (second element of each level)
+        cex_bid_depth = float(bids[0][1]) if len(bids[0]) > 1 else 0.0
+        cex_ask_depth = float(asks[0][1]) if len(asks[0]) > 1 else 0.0
 
         if cex_bid <= 0 or cex_ask <= 0:
             logger.warning("%s  invalid prices bid=%s ask=%s", pair, cex_bid, cex_ask)
             return None
+
+        base_result = {
+            "cex_bid": cex_bid,
+            "cex_ask": cex_ask,
+            "cex_bid_depth": cex_bid_depth,
+            "cex_ask_depth": cex_ask_depth,
+        }
 
         # DEX prices — use pricing module when available, else simulate
         if self.pricing is not None:
             dex_prices = self._fetch_dex_prices(pair, size)
             if dex_prices is not None:
                 return {
-                    "cex_bid": cex_bid,
-                    "cex_ask": cex_ask,
+                    **base_result,
                     "dex_buy": dex_prices["buy"],
                     "dex_sell": dex_prices["sell"],
                 }
@@ -221,8 +232,7 @@ class SignalGenerator:
         # Simulated DEX prices based on CEX mid
         mid = (cex_bid + cex_ask) / 2
         return {
-            "cex_bid": cex_bid,
-            "cex_ask": cex_ask,
+            **base_result,
             "dex_buy": mid * self.dex_buy_markup,
             "dex_sell": mid * self.dex_sell_markup,
         }

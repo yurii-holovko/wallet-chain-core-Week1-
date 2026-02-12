@@ -1,9 +1,17 @@
 import asyncio
+import os
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal
 from enum import Enum, auto
-from typing import Optional
+from typing import Any, Optional
 
+from eth_abi import encode as abi_encode
+from eth_utils import keccak
+
+from chain import ChainClient, TransactionBuilder
+from core.base_types import Address, TokenAmount, TransactionRequest
+from core.wallet_manager import WalletManager
 from executor.recovery import CircuitBreaker, ReplayProtection
 from strategy.signal import Direction, Signal
 
@@ -47,6 +55,15 @@ class ExecutorConfig:
     min_fill_ratio: float = 0.8
     use_flashbots: bool = True
     simulation_mode: bool = True
+    dex_chain_id: int = 11155111
+    dex_deadline_seconds: int = 120
+    dex_slippage_bps: int = 100
+    dex_gas_priority: str = "medium"
+    dex_rpc_url: Optional[str] = None
+    dex_router_address: Optional[str] = None
+    dex_weth_address: Optional[str] = None
+    dex_quote_token_address: Optional[str] = None
+    dex_private_key: Optional[str] = None
 
 
 class Executor:
@@ -66,6 +83,8 @@ class Executor:
 
         self.circuit_breaker = CircuitBreaker()
         self.replay_protection = ReplayProtection()
+        self._dex_client: Optional[ChainClient] = None
+        self._dex_wallet: Optional[WalletManager] = None
 
     async def execute(self, signal: Signal) -> ExecutionContext:
         ctx = ExecutionContext(signal=signal)
@@ -159,6 +178,7 @@ class Executor:
 
         ctx.leg2_fill_price = leg2["price"]
         ctx.leg2_fill_size = leg2["filled"]
+        ctx.leg2_tx_hash = leg2.get("tx_hash")
         ctx.actual_net_pnl = self._calculate_pnl(ctx)
         ctx.state = ExecutorState.DONE
         return ctx
@@ -215,6 +235,7 @@ class Executor:
 
         ctx.leg2_fill_price = leg2["price"]
         ctx.leg2_fill_size = leg2["filled"]
+        ctx.leg2_tx_hash = leg2.get("tx_hash")
         ctx.actual_net_pnl = self._calculate_pnl(ctx)
         ctx.state = ExecutorState.DONE
         return ctx
@@ -230,26 +251,27 @@ class Executor:
             }
         # Real execution via exchange client
         side = "buy" if signal.direction == Direction.BUY_CEX_SELL_DEX else "sell"
-        result = self.exchange.place_order(
+        result = self.exchange.create_limit_ioc_order(
             symbol=signal.pair,
             side=side,
             amount=actual_size,
             price=signal.cex_price * 1.001,
-            order_type="limit",
-            time_in_force="IOC",
         )
         return {
-            "success": result.status == "filled",
-            "price": float(result.price),
-            "filled": float(result.filled),
-            "error": result.status,
+            "success": result["status"] == "filled",
+            "price": float(result["avg_fill_price"]),
+            "filled": float(result["amount_filled"]),
+            "error": result["status"],
         }
 
     async def _execute_dex_leg(self, signal: Signal, size: float) -> dict:
         if self.config.simulation_mode:
             await asyncio.sleep(0.5)
             return {"success": True, "price": signal.dex_price * 0.9998, "filled": size}
-        raise NotImplementedError("Real DEX execution requires Week 2 integration")
+        try:
+            return await asyncio.to_thread(self._execute_real_dex_leg, signal, size)
+        except Exception as exc:
+            return {"success": False, "error": f"DEX execution error: {exc}"}
 
     async def _unwind(self, ctx: ExecutionContext):
         """Market sell to flatten stuck position."""
@@ -266,3 +288,161 @@ class Executor:
             gross = (ctx.leg1_fill_price - ctx.leg2_fill_price) * ctx.leg1_fill_size
         fees = ctx.leg1_fill_size * ctx.leg1_fill_price * 0.004  # ~40 bps
         return gross - fees
+
+    def _execute_real_dex_leg(self, signal: Signal, size: float) -> dict:
+        self._ensure_dex_ready()
+        assert self._dex_client is not None
+        assert self._dex_wallet is not None
+        wallet_addr = Address.from_string(self._dex_wallet.address)
+
+        router = Address.from_string(
+            self._resolve_dex_config("DEX_ROUTER_ADDRESS", "dex_router_address")
+        )
+        weth = self._resolve_dex_config("DEX_WETH_ADDRESS", "dex_weth_address")
+        quote = self._resolve_dex_config(
+            "DEX_QUOTE_TOKEN_ADDRESS", "dex_quote_token_address"
+        )
+        deadline = int(time.time()) + self.config.dex_deadline_seconds
+
+        if signal.direction == Direction.BUY_CEX_SELL_DEX:
+            # Sell exact ETH on DEX: ETH -> quote token.
+            eth_in_wei = self._to_wei(size)
+            min_quote_out = int(
+                self._to_token_units(size * signal.dex_price, 6)
+                * (10_000 - self.config.dex_slippage_bps)
+                / 10_000
+            )
+            calldata = self._encode_call(
+                "swapExactETHForTokens(uint256,address[],address,uint256)",
+                ["uint256", "address[]", "address", "uint256"],
+                [min_quote_out, [weth, quote], wallet_addr.checksum, deadline],
+            )
+            receipt = (
+                TransactionBuilder(self._dex_client, self._dex_wallet)
+                .to(router)
+                .value(TokenAmount(raw=eth_in_wei, decimals=18, symbol="ETH"))
+                .data(calldata)
+                .chain_id(self.config.dex_chain_id)
+                .with_gas_estimate()
+                .with_gas_price(self.config.dex_gas_priority)
+                .send_and_wait(timeout=int(self.config.leg2_timeout))
+            )
+            executed_price = signal.dex_price * (
+                (10_000 - self.config.dex_slippage_bps) / 10_000
+            )
+            return {
+                "success": receipt.status,
+                "price": executed_price,
+                "filled": size,
+                "tx_hash": receipt.tx_hash,
+            }
+
+        # Buy exact ETH on DEX: quote token -> ETH.
+        eth_out_wei = self._to_wei(size)
+        max_quote_in = int(
+            self._to_token_units(size * signal.dex_price, 6)
+            * (10_000 + self.config.dex_slippage_bps)
+            / 10_000
+        )
+        quote_token = Address.from_string(quote)
+        self._ensure_allowance(
+            token=quote_token,
+            owner=wallet_addr,
+            spender=router,
+            min_amount=max_quote_in,
+        )
+        calldata = self._encode_call(
+            "swapTokensForExactETH(uint256,uint256,address[],address,uint256)",
+            ["uint256", "uint256", "address[]", "address", "uint256"],
+            [eth_out_wei, max_quote_in, [quote, weth], wallet_addr.checksum, deadline],
+        )
+        receipt = (
+            TransactionBuilder(self._dex_client, self._dex_wallet)
+            .to(router)
+            .value(TokenAmount(raw=0, decimals=18, symbol="ETH"))
+            .data(calldata)
+            .chain_id(self.config.dex_chain_id)
+            .with_gas_estimate()
+            .with_gas_price(self.config.dex_gas_priority)
+            .send_and_wait(timeout=int(self.config.leg2_timeout))
+        )
+        executed_price = signal.dex_price * (
+            (10_000 + self.config.dex_slippage_bps) / 10_000
+        )
+        return {
+            "success": receipt.status,
+            "price": executed_price,
+            "filled": size,
+            "tx_hash": receipt.tx_hash,
+        }
+
+    def _ensure_dex_ready(self) -> None:
+        if self._dex_client is not None and self._dex_wallet is not None:
+            return
+        rpc_url = self._resolve_dex_config("SEPOLIA_RPC_URL", "dex_rpc_url")
+        private_key = self._resolve_dex_config("PRIVATE_KEY", "dex_private_key")
+        self._dex_client = ChainClient([rpc_url])
+        self._dex_wallet = WalletManager(private_key)
+
+    def _resolve_dex_config(self, env_key: str, config_attr: str) -> str:
+        value = getattr(self.config, config_attr) or os.getenv(env_key)
+        if not value:
+            raise ValueError(f"Missing DEX config: {config_attr} / {env_key}")
+        return value
+
+    def _ensure_allowance(
+        self,
+        token: Address,
+        owner: Address,
+        spender: Address,
+        min_amount: int,
+    ) -> None:
+        assert self._dex_client is not None
+        assert self._dex_wallet is not None
+        allowance_data = self._encode_call(
+            "allowance(address,address)",
+            ["address", "address"],
+            [owner.checksum, spender.checksum],
+        )
+        allowance_call = TransactionRequest(
+            to=token,
+            value=TokenAmount(raw=0, decimals=18, symbol="ETH"),
+            data=allowance_data,
+            chain_id=self.config.dex_chain_id,
+        )
+        allowance_raw = self._dex_client.call(allowance_call)
+        current_allowance = int.from_bytes(allowance_raw, "big") if allowance_raw else 0
+        if current_allowance >= min_amount:
+            return
+
+        max_uint256 = 2**256 - 1
+        approve_data = self._encode_call(
+            "approve(address,uint256)",
+            ["address", "uint256"],
+            [spender.checksum, max_uint256],
+        )
+        receipt = (
+            TransactionBuilder(self._dex_client, self._dex_wallet)
+            .to(token)
+            .value(TokenAmount(raw=0, decimals=18, symbol="ETH"))
+            .data(approve_data)
+            .chain_id(self.config.dex_chain_id)
+            .with_gas_estimate()
+            .with_gas_price(self.config.dex_gas_priority)
+            .send_and_wait(timeout=int(self.config.leg2_timeout))
+        )
+        if not receipt.status:
+            raise RuntimeError("Token approve transaction failed")
+
+    @staticmethod
+    def _encode_call(signature: str, arg_types: list[str], args: list[Any]) -> bytes:
+        selector = keccak(text=signature)[:4]
+        return selector + abi_encode(arg_types, args)
+
+    @staticmethod
+    def _to_wei(value_eth: float) -> int:
+        return int(Decimal(str(value_eth)) * Decimal(10**18))
+
+    @staticmethod
+    def _to_token_units(amount: float, decimals: int) -> int:
+        return int(Decimal(str(amount)) * Decimal(10**decimals))

@@ -64,6 +64,13 @@ class TransactionBuilder:
         self._state.gas_limit = limit
         return self
 
+    def chain_id(self, chain_id: int) -> "TransactionBuilder":
+        """Set EVM chain id for signing."""
+        if chain_id <= 0:
+            raise ValueError("chain_id must be positive")
+        self._state.chain_id = chain_id
+        return self
+
     def with_gas_estimate(self, buffer: float = 1.2) -> "TransactionBuilder":
         """Estimate gas and set limit with buffer."""
         if buffer <= 0:
