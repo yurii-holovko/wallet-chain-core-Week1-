@@ -32,16 +32,29 @@ from pathlib import Path
 # Ensure src/ is on sys.path so bare imports work from scripts/
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from demo_double_limit import main as double_limit_main  # noqa: E402
+
 from chain import ChainClient  # noqa: E402
 from core.base_types import Address, TokenAmount, TransactionRequest  # noqa: E402
 from core.wallet_manager import WalletManager  # noqa: E402
 from exchange.client import ExchangeClient  # noqa: E402
-from executor.alerts import WebhookAlerter, WebhookConfig  # noqa: E402
+from executor.alerts import (  # noqa: E402
+    Alert,
+    AlertLevel,
+    AlertType,
+    WebhookAlerter,
+    WebhookConfig,
+)
 from executor.engine import Executor, ExecutorConfig, ExecutorState  # noqa: E402
 from executor.metrics import MetricsRegistry, MetricsServer  # noqa: E402
 from executor.recovery import RecoveryConfig  # noqa: E402
 from inventory.tracker import InventoryTracker, Venue  # noqa: E402
 from pricing.dex_pricer import DexPricer  # noqa: E402
+from safety import (  # noqa: E402
+    ABSOLUTE_MIN_CAPITAL,
+    is_kill_switch_active,
+    safety_check,
+)
 from strategy.fees import FeeStructure  # noqa: E402
 from strategy.generator import SignalGenerator  # noqa: E402
 from strategy.priority_queue import (  # noqa: E402
@@ -50,6 +63,7 @@ from strategy.priority_queue import (  # noqa: E402
 )
 from strategy.scorer import ScorerConfig, SignalScorer  # noqa: E402
 from strategy.signal import Direction  # noqa: E402
+from telegram_bot import TelegramBot, TelegramBotConfig  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +121,8 @@ class ArbBot:
 
         simulation_mode = config.get("simulation", True)
         self.simulation_mode = simulation_mode
+        # Dry-run mode: run full pipeline but do NOT execute trades by default.
+        self.dry_run = bool(config.get("dry_run", True))
         self.sim_wallet_eth = config.get("sim_wallet_eth", 1.0)
         self.sim_wallet_usdt = config.get("sim_wallet_usdt", 5000.0)
         self.wallet: WalletManager | None = None
@@ -119,6 +135,12 @@ class ArbBot:
             config.get("dex_quote_decimals", os.getenv("DEX_QUOTE_TOKEN_DECIMALS", "6"))
         )
         self.dex_chain_id = int(config.get("dex_chain_id", 11155111))
+
+        # Absolute safety accounting (approximate, for hard-stop gates).
+        self._starting_capital_usd = float(
+            config.get("starting_capital_usd", max(ABSOLUTE_MIN_CAPITAL, 100.0))
+        )
+        self._trade_timestamps: list[float] = []
 
         # ── Chain client (read-only for DEX pricing) ──────────
         # Explicit None in config means "no DEX pricing" — skip fallbacks.
@@ -231,12 +253,49 @@ class ArbBot:
             )
 
         self.alerter.start()
+        # Alert: bot started
+        self.alerter.send(
+            Alert(
+                alert_type=AlertType.CUSTOM,
+                level=AlertLevel.INFO,
+                pair=None,
+                message=f"ArbBot started (mode={exec_mode}, dry_run={self.dry_run})",
+            )
+        )
         self.metrics_server.start()
 
         await self._sync_balances()
 
+        kill_logged = False
+
         while self.running:
             try:
+                if is_kill_switch_active():
+                    if not kill_logged:
+                        logging.warning("Kill switch active — ArbBot PAUSED.")
+                        self.alerter.send(
+                            Alert(
+                                alert_type=AlertType.CUSTOM,
+                                level=AlertLevel.CRITICAL,
+                                pair=None,
+                                message="Kill switch activated — ArbBot paused (no new trades).",
+                            )
+                        )
+                        kill_logged = True
+                    await asyncio.sleep(1)
+                    continue
+                else:
+                    if kill_logged:
+                        logging.info("Kill switch cleared — ArbBot RESUMING.")
+                        self.alerter.send(
+                            Alert(
+                                alert_type=AlertType.CUSTOM,
+                                level=AlertLevel.INFO,
+                                pair=None,
+                                message="Kill switch cleared — ArbBot resuming.",
+                            )
+                        )
+                        kill_logged = False
                 await self._tick()
                 await asyncio.sleep(1)
             except Exception as e:
@@ -297,6 +356,44 @@ class ArbBot:
         for signal in self.priority_queue.drain():
             pair = signal.pair
 
+            trade_value_usd = signal.size * signal.cex_price
+            stats = self.executor.stats
+            cumulative_pnl = float(stats.get("total_pnl", 0.0))
+            daily_loss = min(0.0, cumulative_pnl)
+            total_capital = self._starting_capital_usd + cumulative_pnl
+            trades_this_hour = self._trades_last_hour()
+
+            allowed, reason = safety_check(
+                trade_usd=trade_value_usd,
+                daily_loss=daily_loss,
+                total_capital=total_capital,
+                trades_this_hour=trades_this_hour,
+            )
+            if not allowed:
+                logging.warning("Safety check blocked trade %s: %s", pair, reason)
+                # Alert: absolute safety limit hit (e.g. daily loss)
+                self.alerter.send(
+                    Alert(
+                        alert_type=AlertType.CUSTOM,
+                        level=AlertLevel.CRITICAL,
+                        pair=pair,
+                        message=f"Safety check blocked trade: {reason}",
+                    )
+                )
+                continue
+
+            if self.dry_run:
+                logging.info(
+                    "DRY RUN | Would trade: %s %s size=%.4f spread=%.1fbps "
+                    "expected_pnl=$%.2f",
+                    pair,
+                    signal.direction.value,
+                    signal.size,
+                    signal.spread_bps,
+                    signal.expected_net_pnl,
+                )
+                continue
+
             logging.info(
                 "Executing: %s %.4g %s",
                 signal.direction.name,
@@ -344,6 +441,23 @@ class ArbBot:
             self.metrics.cb_state.set(cb_val, pair=pair)
 
             await self._sync_balances()
+
+            # Count successful executions for hourly safety limits.
+            if ctx.state == ExecutorState.DONE:
+                self._record_trade_execution()
+                # Alert: trade completed with PnL
+                self.alerter.send(
+                    Alert(
+                        alert_type=AlertType.CUSTOM,
+                        level=AlertLevel.INFO,
+                        pair=pair,
+                        message=(
+                            f"Trade completed: pair={pair} "
+                            f"net_pnl=${(ctx.actual_net_pnl or 0):.4f}"
+                        ),
+                        details={"state": ctx.state.name},
+                    )
+                )
 
     async def _sync_balances(self):
         if self.simulation_mode:
@@ -431,6 +545,15 @@ class ArbBot:
     @staticmethod
     def _base_asset(pair: str) -> str:
         return pair.split("/")[0] if "/" in pair else pair
+
+    def _trades_last_hour(self) -> int:
+        now = time.time()
+        cutoff = now - 3600.0
+        self._trade_timestamps = [t for t in self._trade_timestamps if t >= cutoff]
+        return len(self._trade_timestamps)
+
+    def _record_trade_execution(self) -> None:
+        self._trade_timestamps.append(time.time())
 
     def _log_circuit_breaker_status(self, pair: str, snapshot: dict) -> None:
         cb = snapshot.get("circuit_breaker", {})
@@ -524,6 +647,10 @@ class PaperBot:
 
         while self.running:
             try:
+                if is_kill_switch_active():
+                    logger.warning("Kill switch active — stopping PaperBot.")
+                    self.stop()
+                    break
                 await self._tick()
                 await asyncio.sleep(self.tick_interval)
             except KeyboardInterrupt:
@@ -797,39 +924,77 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--mode",
-        choices=["simulation", "paper"],
+        choices=["simulation", "paper", "double_limit"],
         default="simulation",
         help=(
-            "simulation — fake DEX prices, frequent trades, full pipeline\n"
-            "             (scoring, inventory, circuit breaker, recovery)\n"
-            "paper      — REAL CEX + DEX prices, simulated execution,\n"
-            "             live PnL dashboard with trade log"
+            "simulation   — fake DEX prices, frequent trades, full pipeline\n"
+            "               (scoring, inventory, circuit breaker, recovery)\n"
+            "paper        — REAL CEX + DEX prices, simulated execution,\n"
+            "               live PnL dashboard with trade log\n"
+            "double_limit — Arbitrum/MEXC Double Limit micro-arb dry-run\n"
+            "               (same behavior as scripts/demo_double_limit.py)"
+        ),
+    )
+    parser.add_argument(
+        "--trade-size",
+        type=float,
+        default=None,
+        help=(
+            "Trade size in USD (for double_limit mode). "
+            "Default: 5.0 (from TRADE_SIZE_USD env var or config). "
+            "Common values: 5.0, 10.0"
         ),
     )
     args = parser.parse_args()
 
+    # Structured logging to both file and stdout
+    from datetime import datetime as _dt
+    from pathlib import Path as _Path
+
+    log_dir = _Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / f"bot_{_dt.now():%Y%m%d}.log"
+
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        format="%(asctime)s |%(levelname)s |%(message)s",
+        handlers=[
+            logging.FileHandler(log_file),
+            logging.StreamHandler(),
+        ],
     )
     # Suppress noisy third-party logs
     logging.getLogger("ccxt").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
-    if args.mode == "simulation":
-        config = _build_simulation_config()
-        bot = ArbBot(config)
-        try:
-            asyncio.run(bot.run())
-        except KeyboardInterrupt:
-            bot.stop()
+    # Shared Telegram bot for all modes (if configured)
+    tg = TelegramBot(TelegramBotConfig.from_env())
+    tg.start()
 
-    elif args.mode == "paper":
-        config = _build_paper_config()
-        bot = PaperBot(config)
-        try:
-            asyncio.run(bot.run())
-        except KeyboardInterrupt:
-            bot.stop()
-            bot._print_summary()
+    try:
+        if args.mode == "simulation":
+            config = _build_simulation_config()
+            bot = ArbBot(config)
+            try:
+                asyncio.run(bot.run())
+            except KeyboardInterrupt:
+                bot.stop()
+
+        elif args.mode == "paper":
+            config = _build_paper_config()
+            bot = PaperBot(config)
+            try:
+                asyncio.run(bot.run())
+            except KeyboardInterrupt:
+                bot.stop()
+                bot._print_summary()
+
+        elif args.mode == "double_limit":
+            # Run the Double Limit micro-arb demo (observation-only) via this entrypoint.
+            try:
+                trade_size = args.trade_size if args.trade_size is not None else None
+                asyncio.run(double_limit_main(trade_size_usd=trade_size))
+            except KeyboardInterrupt:
+                logging.info("Stopping Double Limit mode.")
+    finally:
+        tg.stop()
