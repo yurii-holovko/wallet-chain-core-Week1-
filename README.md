@@ -1499,3 +1499,34 @@ Compared to a “basic” internship-style arb loop (single Uniswap V2 swap + ME
 The codebase supports **full production trading** with `--execute` flag: real MEXC limit orders and DEX swaps (ODOS or V3 direct, chosen by route selection) execute on-chain. The observation and simulated execution modes allow you to validate economics and safety before enabling live trading.
 
 </details>
+
+---
+
+## Conclusion
+
+After five weeks of development, this project has evolved from basic wallet management to a production-ready micro-arbitrage trading system. The journey covered secure key management, on-chain transaction building, AMM pricing and routing, CEX integration, strategy execution, and finally a focused Arbitrum ⇄ MEXC micro-arbitrage engine with parallel route monitoring.
+
+### Documentation
+
+For detailed analysis and reflections on the project:
+
+- **Final Report (Part 6)**: See `docs/final_report_part6.docx` for comprehensive technical documentation, architecture decisions, and production deployment considerations.
+- **Trading Journal (Days 1-3)**: See `docs/trading_journal_days1-3.docx` for real-world trading observations, PnL analysis, and operational learnings from live production runs.
+
+### What I Learned
+
+Through building this system, several key insights emerged:
+
+- **Safety First**: Hard-coded absolute limits (`ABSOLUTE_MAX_TRADE_USD`, `ABSOLUTE_MAX_DAILY_LOSS`) and kill switches are essential for production trading. No amount of testing replaces having emergency stops.
+
+- **Route Optimization Matters**: Parallel monitoring of ODOS aggregator and V3 direct routes, combined with `RouteHealthTracker`, can significantly improve execution quality. Gas costs vary dramatically, and historical tracking helps avoid unreliable routes.
+
+- **Dry-Run Validation is Critical**: The observation and simulated execution modes caught numerous edge cases before real capital was at risk. Cost verification scripts (`verify_all_costs.py`, `verify_tokens.py`) are invaluable for catching configuration errors.
+
+- **Micro-Arbitrage Economics**: For small trade sizes ($5–10), fixed costs (bridge fees, gas) must be amortized carefully. The `CapitalManager` bridge thresholding model prevents unprofitable trades that don't cover fixed costs.
+
+- **Production Observability**: Structured logging, Prometheus metrics, Telegram alerts, and execution reports are not optional for production trading. When real money is at stake, visibility into every execution is essential.
+
+- **Incremental Development**: Building week-by-week (wallet → chain → pricing → exchange → execution → production) allowed each layer to be tested independently before integration. This modular approach made debugging much easier.
+
+The codebase now supports full production trading with real orders, but the safety mechanisms, dry-run modes, and comprehensive logging ensure that every execution is monitored, every failure is analyzed, and every improvement is data-driven.
